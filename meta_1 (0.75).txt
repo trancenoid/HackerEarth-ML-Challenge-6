@@ -1,0 +1,109 @@
+import pandas as pd
+import numpy as np
+
+train = pd.read_csv('train.csv')
+testSplit = train.shape[0]
+test = pd.read_csv('test.csv')
+bld_own = pd.read_csv('Building_Ownership_Use.csv')
+bld_own = bld_own.drop(['has_secondary_use_agriculture','has_secondary_use_hotel','has_secondary_use_rental'
+                      ,'has_secondary_use_institution','has_secondary_use_school','has_secondary_use_industry','has_secondary_use_health_post'
+                      ,'has_secondary_use_gov_office','has_secondary_use_use_police','has_secondary_use_other'], axis = 1)
+bld_struct = pd.read_csv('Building_Structure.csv')
+train_y = train['damage_grade']
+train.drop(['damage_grade'], axis = 1, inplace = True)
+bld_own = bld_own.merge(bld_struct, on = ['building_id', 'vdcmun_id', 'ward_id', 'district_id'])
+train = pd.concat([train,test])
+train = train.merge(bld_own, on = ['building_id', 'vdcmun_id', 'district_id'] )
+index = test['building_id']
+train = train.drop(['building_id'], axis = 1)
+print(train.shape[0])
+
+num_col = train.select_dtypes(exclude = ['object'])
+cat_col = train.select_dtypes(include = ['object'])
+for x in cat_col.columns:
+    print(str(x) + " " + str(train[x].unique()))
+
+#preprocessing
+# age -> into 6 categories (median)
+# height -> into 5 categories (median)
+# *new feature* -> height diff pre/post
+# count floors -> 3 categories
+# *new feature* -> floor diff
+# count_families -> into 5 categories
+# label encode cat_cols
+train['height_diff'] = train['height_ft_pre_eq'] - train['height_ft_post_eq']
+train['count_floors_diff'] = train['count_floors_pre_eq'] - train['count_floors_post_eq']
+train.count_families.fillna(train.count_families.mode()[0], inplace = True)
+bins_age = [0,10,30,70,150,200,1000]
+bins_height = [0,5,14,17,20,50,96,306]
+bins_families = []
+indx_age = pd.Series(np.digitize(train['age_building'], bins_age))
+indx_height_pre = pd.Series(np.digitize(train['height_ft_pre_eq'],bins_height ))
+indx_height_post = pd.Series(np.digitize(train['height_ft_post_eq'],bins_height ))
+#train['age_bins'] = indx_age.map(lambda x : int((bins_age[x] + bins_age[x-1])/2))
+#train['height_pre_bins'] = indx_height_pre.map(lambda x : bins_height[x-1])
+train['height_post_bins'] = indx_height_post.map(lambda x : bins_height[x-1])
+train.has_repair_started.fillna(0, inplace = True)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+le = LabelEncoder()
+ss = StandardScaler()
+for x in num_col.columns:
+    ss.fit(train[x].reshape(-1,1))
+    train[x] = ss.transform(train[x].reshape(-1,1))
+for x in cat_col.columns:
+    le.fit(train[x])
+    train[x] = le.transform(train[x])
+#train = train.drop(['height_ft_pre_eq','height_ft_post_eq','age_building'], axis = 1)
+le.fit(train_y)
+train_y = le.transform(train_y)
+train_y = pd.Series(train_y)
+
+ans = pd.read_csv('meta.csv')
+predicted  = le.inverse_transform(ans['damage_grade'].values)
+submission = pd.DataFrame({'building_id': index, 'damage_grade': predicted})
+submission.to_csv('meta_1.csv', index=False)
+
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.svm import SVC
+from sklearn.model_selection import KFold
+import copy
+xgb = XGBClassifier(n_estimators=500, max_depth=10, learning_rate=0.05)
+rafo = RandomForestClassifier(min_samples_leaf=2, n_estimators=200, verbose=True)
+svm = SVC(class_weight='balanced', C=0.5, verbose=True)
+kfold = KFold(n_splits=2, shuffle=True, random_state=131)
+results = pd.DataFrame({'xgb': [], 'rafo': [], 'svm': []})
+results['actual'] = train_y
+for train_index, test_index in kfold.split(train[:testSplit], train_y[:testSplit]):
+    model_x = copy.copy(xgb)
+    model_y = copy.copy(rafo)
+    model_z = copy.copy(svm)
+    model_x.fit(train.iloc[train_index], train_y.iloc[train_index])
+    model_y.fit(train.iloc[train_index], train_y.iloc[train_index])
+    model_z.fit(train.iloc[train_index], train_y.iloc[train_index])
+    results['xgb'].iloc[test_index] = model_x.predict(train.iloc[test_index])
+    results['rafo'].iloc[test_index] = model_y.predict(train.iloc[test_index])
+    results['svm'].iloc[test_index] = model_z.predict(train.iloc[test_index])
+
+results.drop(['actual'], axis=1, inplace=True)
+results.dropna(axis=0, inplace=True)
+
+xgb.fit(train[:testSplit], train_y[:testSplit])
+rafo.fit(train[:testSplit], train_y[:testSplit])
+svm.fit(train[:testSplit], train_y[:testSplit])
+predicted_xgb = pd.Series(xgb.predict(train[testSplit:]))
+predicted_rafo = pd.Series(rafo.predict(train[testSplit:]))
+predicted_svm = pd.Series(svm.predict(train[testSplit:]))
+results_final = pd.DataFrame({'xgb': predicted_xgb, 'rafo': predicted_rafo, 'svm': predicted_svm})
+
+meta = RandomForestClassifier(n_estimators=200, min_samples_leaf=2)
+meta.fit(results, train_y)
+predicted = pd.Series(meta.predict(results_final))
+
+submission = pd.DataFrame({'building_id': index, 'damage_grade': predicted})
+submission.to_csv('meta.csv', index=False)
+# XGB Params : {'n_estimators': 100, 'max_depth': 5, 'learning_rate': 0.05} Score : 0.7136549558041454
+# SVM Params : {'verbose': True, 'class_weight': 'balanced', 'C': 0.5} Score : 0.700797282818
+# RAFO Params = {'min_samples_leaf' : [2],'n_estimators' : [200 ],'n_jobs' : [1],'verbose' : [True],'oob_score' : [True]
+
